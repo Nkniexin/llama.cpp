@@ -538,6 +538,7 @@ struct clip_ctx {
     bool has_llava_projector = false;
     bool has_minicpmv_projector = false;
     int minicpmv_version = 2;
+    int max_slice_nums = 9;
 
     struct clip_vision_model vision_model;
     projector_type proj_type = PROJECTOR_TYPE_MLP;
@@ -2625,4 +2626,8 @@ int clip_is_minicpmv(const struct clip_ctx * ctx) {
         return ctx->minicpmv_version;
     }
     return 0;
+}
+
+void clip_uhd_max_slice_nums(struct clip_ctx * ctx, int max_slice_nums) {
+    ctx->max_slice_nums = max_slice_nums;
 }

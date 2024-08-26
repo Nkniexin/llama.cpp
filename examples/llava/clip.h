@@ -87,6 +87,8 @@ CLIP_API bool clip_model_quantize(const char * fname_inp, const char * fname_out
 
 CLIP_API int clip_is_minicpmv(const struct clip_ctx * ctx);
 
+CLIP_API void clip_uhd_max_slice_nums(struct clip_ctx * ctx, int max_slice_nums);
+
 #ifdef __cplusplus
 }
 #endif

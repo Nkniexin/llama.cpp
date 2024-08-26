@@ -57,11 +57,19 @@ static struct llama_model * llava_init(gpt_params * params) {
     return model;
 }
 
-static struct llava_context * llava_init_context(gpt_params * params, llama_model * model) {
+static struct llava_context * llava_init_context(gpt_params * params) {
+    auto model = llava_init(params);
+    if (model == NULL) {
+        fprintf(stderr, "%s: error: failed to init minicpmv model\n", __func__);
+        return NULL;
+    }
+
+    const char * clip_path = params->mmproj.c_str();
     auto prompt = params->prompt;
     if (prompt.empty()) {
         prompt = "describe the image in detail.";
     }
+    auto ctx_clip = clip_model_load(clip_path, /*verbosity=*/ 1);
 
     llama_context_params ctx_params = llama_context_params_from_gpt_params(*params);
     if (params->n_ctx < 2048) {
@@ -82,32 +90,10 @@ static struct llava_context * llava_init_context(gpt_params * params, llama_mode
     auto ctx_llava = (struct llava_context *)malloc(sizeof(llava_context));
 
     ctx_llava->ctx_llama = ctx_llama;
+    ctx_llava->ctx_clip = ctx_clip;
     ctx_llava->model = model;
     return ctx_llava;
 }
-
-static void llava_free(struct llava_context * ctx_llava) {
-    if (ctx_llava->ctx_clip) {
-        clip_free(ctx_llava->ctx_clip);
-        ctx_llava->ctx_clip = NULL;
-    }
-
-    llama_free(ctx_llava->ctx_llama);
-    llama_free_model(ctx_llava->model);
-    llama_backend_free();
-}
-
-static struct clip_ctx * clip_init_context(gpt_params * params) {
-    const char * clip_path = params->mmproj.c_str();
-
-    auto prompt = params->prompt;
-    if (prompt.empty()) {
-        prompt = "describe the image in detail.";
-    }
-    auto ctx_clip = clip_model_load(clip_path, /*verbosity=*/ 1);
-    return ctx_clip;
-}
-
 static bool eval_tokens(struct llama_context * ctx_llama, std::vector<llama_token> tokens, int n_batch, int * n_past) {
     int N = (int) tokens.size();
     for (int i = 0; i < N; i += n_batch) {
@@ -136,6 +122,63 @@ static bool eval_string(struct llama_context * ctx_llama, const char* str, int n
     return eval_tokens(ctx_llama, embd_inp, n_batch, n_past);
 }
 
+static bool process_prompt(int type, struct llava_context * ctx_llava, gpt_params * params, int &n_past, std::string prompt = ""){
+    int has_minicpmv_projector = clip_is_minicpmv(ctx_llava->ctx_clip);
+    if (type==0) {
+        std::string system_prompt;
+        if (has_minicpmv_projector == 1) {
+            system_prompt = "<用户>";
+        }
+        else if (has_minicpmv_projector == 2) {
+            system_prompt = "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n";
+        }
+        else if (has_minicpmv_projector == 3) {
+            system_prompt = "<|im_start|>user\n";
+        }
+        return eval_string(ctx_llava->ctx_llama, system_prompt.c_str(), params->n_batch, &n_past, false);
+    }
+    else if (type==1) {
+        std::string user_prompt = prompt;
+        return eval_string(ctx_llava->ctx_llama, user_prompt.c_str(), params->n_batch, &n_past, false);
+    }
+    else if (type==2) {
+        if (has_minicpmv_projector == 1) {
+            return eval_string(ctx_llava->ctx_llama, "<AI>\n", params->n_batch, &n_past, false);
+        }
+        else if (has_minicpmv_projector == 2) {
+            return eval_string(ctx_llava->ctx_llama, "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n", params->n_batch, &n_past, false);
+        }
+        else if (has_minicpmv_projector == 3) {
+            return eval_string(ctx_llava->ctx_llama, "<|im_end|><|im_start|>assistant\n", params->n_batch, &n_past, false);
+        }
+    }
+    return 0;
+}
+
+static void llava_free(struct llava_context * ctx_llava) {
+    if (ctx_llava->ctx_clip) {
+        clip_free(ctx_llava->ctx_clip);
+        ctx_llava->ctx_clip = NULL;
+    }
+
+    llama_free(ctx_llava->ctx_llama);
+    llama_free_model(ctx_llava->model);
+    llama_backend_free();
+}
+
+static struct clip_ctx * clip_init_context(gpt_params * params) {
+    const char * clip_path = params->mmproj.c_str();
+
+    auto prompt = params->prompt;
+    if (prompt.empty()) {
+        prompt = "describe the image in detail.";
+    }
+    auto ctx_clip = clip_model_load(clip_path, /*verbosity=*/ 1);
+    return ctx_clip;
+}
+
+
+
 static void process_eval_image_embed(struct llava_context * ctx_llava, const struct llava_image_embed * embeds, int n_batch, int * n_past, int idx) {
     float * image_embed = (float *)malloc(clip_embd_nbytes(ctx_llava->ctx_clip));
     std::memcpy(image_embed, embeds->embed + idx * clip_n_patches(ctx_llava->ctx_clip) * clip_n_mmproj_embd(ctx_llava->ctx_clip), clip_embd_nbytes(ctx_llava->ctx_clip));
@@ -147,15 +190,15 @@ static void process_eval_image_embed(struct llava_context * ctx_llava, const str
     llava_image_embed_free(slice_embed);
 }
 
-static void process_image(struct llava_context * ctx_llava, struct llava_image_embed * embeds, gpt_params * params, int &n_past) {
+static int process_image(struct llava_context * ctx_llava, struct llava_image_embed * embeds, gpt_params * params, int &n_past) {
     std::string system_prompt;
+    bool res = false;
     int idx = 0;
-    int num_image_embeds = embeds->n_image_pos / clip_n_patches(ctx_llava->ctx_clip);
-    system_prompt = "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n";
+    int num_image_embeds = embeds->n_image_pos / clip_n_patches(ctx_llava->ctx_clip);    
     LOG_TEE("%s: image token past: %d\n", __func__, n_past);
     eval_string(ctx_llava->ctx_llama, (system_prompt+"<image>").c_str(), params->n_batch, &n_past, false);
     process_eval_image_embed(ctx_llava, embeds, params->n_batch, &n_past, idx++);
-    eval_string(ctx_llava->ctx_llama, std::string("</image>").c_str(), params->n_batch, &n_past, false);
+    res = eval_string(ctx_llava->ctx_llama, std::string("</image>").c_str(), params->n_batch, &n_past, false);
     if (num_image_embeds > 1) {
         size_t num_image_embeds_col = clip_uhd_num_image_embeds_col(ctx_llava->ctx_clip);
         eval_string(ctx_llava->ctx_llama, std::string("<slice>").c_str(), params->n_batch, &n_past, false);
@@ -169,9 +212,22 @@ static void process_image(struct llava_context * ctx_llava, struct llava_image_e
                 }
             }
         }
-        eval_string(ctx_llava->ctx_llama, std::string("</slice>").c_str(), params->n_batch, &n_past, false);
+        res = eval_string(ctx_llava->ctx_llama, std::string("</slice>").c_str(), params->n_batch, &n_past, false);
     }
     LOG_TEE("%s: image token past: %d\n", __func__, n_past);
+    if(!res) return 0;
+    return n_past;
+}
+
+
+static struct llava_image_embed * interleaved_image_embed(struct clip_ctx * ctx_clip, gpt_params * params, const std::string & fname){
+    clip_uhd_max_slice_nums(ctx_clip, 9);
+    llava_image_embed * embed = llava_image_embed_make_with_filename(ctx_clip, params->n_threads, fname.c_str());
+    if (!embed) {
+        LOG_TEE("error: failed to embed image Terminating\n\n");
+        return NULL;
+    }
+    return embed;
 }
 
 static const char * sample(struct llama_sampling_context * ctx_sampling,
@@ -203,13 +259,8 @@ static struct llava_context * minicpmv_init(gpt_params * params, const std::stri
         return NULL;
     }
 
-    auto model = llava_init(params);
-    if (model == NULL) {
-        fprintf(stderr, "%s: error: failed to init minicpmv model\n", __func__);
-        return NULL;
-    }
     const int64_t t_llava_init_start_us = ggml_time_us();
-    auto ctx_llava = llava_init_context(params, model);
+    auto ctx_llava = llava_init_context(params);
     ctx_llava->ctx_clip = ctx_clip;
     const int64_t t_llava_init_end_us = ggml_time_us();
     float t_llava_init_ms = (t_llava_init_end_us - t_llava_init_start_us) / 1000.0;
@@ -225,6 +276,17 @@ static struct llava_context * minicpmv_init(gpt_params * params, const std::stri
     return ctx_llava;
 }
 
+static int process_input(struct llava_context * ctx_llava, gpt_params * params, int type, std::string prompt, int &n_past, struct llava_image_embed * embeds = nullptr){
+    if (type==0) {
+        if (process_prompt(1, ctx_llava, params, n_past, prompt)) return 1;
+    }
+    else if (type == 1) {
+        if(embeds != NULL){
+            return (process_image(ctx_llava, embeds, params, n_past));
+        }
+    }
+    return 0;
+}
 static struct llama_sampling_context * llama_init(struct llava_context * ctx_llava, gpt_params * params, std::string prompt, int &n_past, bool is_first = false){
     std::string user_prompt = prompt;
     if (!is_first) user_prompt = "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n" + prompt;
@@ -248,7 +310,7 @@ static const char * llama_loop(struct llava_context * ctx_llava,struct llama_sam
 static gpt_params params;
 static std::string CurrentContent = "";
 static int curnum = 0;
-static bool StopFlag = 0;
+static bool StopFlag = 0;        //一次对话结束的标志
 static std::queue<std::string>q;
 static int n_past = 0;
 static struct llava_context * ctx_llava; 
@@ -271,60 +333,52 @@ bool decodeBase64ToFile(const std::string& base64_data, const std::string& outpu
 void upload_image(const httplib::Request& req, httplib::Response& res){
     
     auto data = json::parse(req.body.c_str());
+    params.image.clear();
 
-    // std::string image_base64 = data["image"];
-    // std::string image_path = "resized_image.jpg";
-    // decodeBase64ToFile(image_base64,image_path);
+    if(data.contains("image")&& data["image"].is_array()){ //支持传入多张图片，进行单图或多图联合理解。
+        std::vector<std::string>images = data["image"].get<std::vector<std::string>>();
 
-    // params.image.resize(1);
-    
-    // int width, height, channels;
-    // unsigned char *image = stbi_load(image_path.c_str(), &width, &height, &channels, 0);
-
-    // float now = width*height;
-
-    // float max_target = 128*128;
-
-    // float k = std::sqrt(max_target/now);
-
-    // int new_width = int(k*width);
-    // int new_height = int(k*height);
-
-    // unsigned char *resized_image = new unsigned char[new_width*new_height*channels];
-
-    // if (stbir_resize_uint8(image, width, height, 0, resized_image, new_width, new_height, 0, channels) == 0) {
-    //     std::cerr << "Failed to resize image." << std::endl;
-    //     stbi_image_free(image);
-    //     delete[] resized_image;
-    //     return ;
-    // }
-
-    // if (stbi_write_jpg("resized_image.jpg", new_width, new_height, channels, resized_image, 100) == 0) {
-    //     std::cerr << "Failed to save resized image." << std::endl;
-    //     stbi_image_free(image);
-    //     delete[] resized_image;
-    //     return ;
-    // }
-
-    // stbi_image_free(image);
-    // delete[] resized_image;
-
-    params.image[0]="resized_image.jpg";
-
-    // image_path = params.image[0];
-    std::string image_path = "C:\\Users\\xinni\\Desktop\\2.PNG";
-    n_past = 0;
-    if(ctx_released == 0){
-        ctx_llava->model = NULL;
-        llava_free(ctx_llava);
-        ctx_released = 1;
+        for(int i = 0 ;i<images.size();i++){
+            std::string image_path = "image"+std::to_string(i);
+            params.image.push_back(image_path);
+            decodeBase64ToFile(images[i],image_path);
+        }
     }
-    ctx_llava = minicpmv_init(&params, image_path, n_past);
-    ctx_released = 0 ;
+
+    if(ctx_released == 0){
+            ctx_llava->model = NULL;
+            llava_free(ctx_llava);
+            ctx_released = 1;
+    }
+
+    if(params.image.size() == 0){
+        res.set_content("no images uploaded!","text/plain");
+        return ;
+    }
+
+    else if (params.image.size() == 1){
+        std::string image_path = params.image[0];
+        n_past = 0;
+        ctx_llava = minicpmv_init(&params, image_path, n_past);
+        ctx_released = 0 ;
+    }
+
+    else{
+        n_past = 0;
+        ctx_llava = llava_init_context(&params);
+        process_prompt(0, ctx_llava, &params, n_past);
+        for (auto & image : params.image) {
+            auto embeds = interleaved_image_embed(ctx_llava->ctx_clip, &params, image);
+            process_input(ctx_llava, &params, 1, "", n_past, embeds);
+        }
+        ctx_released = 0 ;
+    }
     res.set_content("upload successfully","text/plain");
 }
 
 void generate_text(const std::string& prompt){
+    if(params.image.size() == 1){
+        //std::cout<<"niexin"<<std::endl;
         auto ctx_sampling = llama_init(ctx_llava, &params, prompt, n_past, true);
         const int max_tgt_len = params.n_predict < 0 ? 256 : params.n_predict;
         for (int i = 0; i < max_tgt_len; i++) {
@@ -337,10 +391,38 @@ void generate_text(const std::string& prompt){
             fflush(stdout);
         }
         llama_sampling_free(ctx_sampling);
+    }
+    else{
+        //std::cout<<"niexin"<<std::endl;
+        params.prompt = prompt;
+        process_input(ctx_llava, &params, 0, params.prompt.c_str(), n_past);
+        //process_prompt(1, ctx_llava, &params, n_past,"这两张图片一样吗\n");
+        process_prompt(2, ctx_llava, &params, n_past);
+
+        struct llama_sampling_context * ctx_sampling = llama_sampling_init(params.sparams);
+        const int max_tgt_len = params.n_predict < 0 ? 8192 : params.n_predict;
+        std::string response = "";
+        bool have_tmp = false;
+        for (int i = 0; i < max_tgt_len; i++) {
+            auto tmp = llama_loop(ctx_llava, ctx_sampling, n_past);
+            response += tmp;
+            if (strcmp(tmp, "</s>") == 0){
+                if(!have_tmp)continue;
+                else break;
+            }
+            have_tmp = true;
+            printf("%s", tmp);
+            if (strstr(response.c_str(), "<user>")) break; // minicpm-v 
+
+            fflush(stdout);
+        }
+        llama_sampling_free(ctx_sampling);
+
+    }
         StopFlag = 1;
 }
 
-void chat_image(const httplib::Request & Req,httplib::Response& res){
+void chat_image(const httplib::Request & Req,httplib::Response& res){ //跟图片进行对话
 
     if(ctx_released == 1){
         return ;
@@ -380,7 +462,7 @@ void chat_image(const httplib::Request & Req,httplib::Response& res){
     });
 }
 
-void chat_release(const httplib::Request& req,httplib::Response&res){
+void chat_release(const httplib::Request& req,httplib::Response&res){ //释放ctx_llava
     if(ctx_released == 0){
         ctx_llava->model = NULL;
         llava_free(ctx_llava);
@@ -403,7 +485,7 @@ int main(int argc, char ** argv) {
     llama_log_set(llama_log_callback_logTee, nullptr);
 #endif // LOG_DISABLE_LOGS
 
-    if (params.mmproj.empty() || (params.image.empty())) {
+    if (params.mmproj.empty()) {
         gpt_params_print_usage(argc, argv, params);
         show_additional_info(argc, argv);
         return 1;
