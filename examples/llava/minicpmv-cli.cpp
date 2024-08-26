@@ -4,10 +4,27 @@
 #include "clip.h"
 #include "llava.h"
 #include "llama.h"
+#include "httplib.h"
+#include "json.hpp"
+using json = nlohmann::json;
+
+
+#include "stb_image.h"
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include <stb_image_write.h>
+#define STB_IMAGE_RESIZE_IMPLEMENTATION
+#include "stb_image_resize.h"
+
+
 
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
+#include <queue>
+#include <algorithm>
+#include <cmath>
+#include "math.h"
+#include "base64.hpp"
 
 struct llava_context {
     struct clip_ctx * ctx_clip = NULL;
@@ -134,13 +151,7 @@ static void process_image(struct llava_context * ctx_llava, struct llava_image_e
     std::string system_prompt;
     int idx = 0;
     int num_image_embeds = embeds->n_image_pos / clip_n_patches(ctx_llava->ctx_clip);
-    int has_minicpmv_projector = clip_is_minicpmv(ctx_llava->ctx_clip);
-    if (has_minicpmv_projector == 2) {
-        system_prompt = "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n";
-    }
-    else if (has_minicpmv_projector == 3) {
-        system_prompt = "<|im_start|>user\n";
-    }
+    system_prompt = "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n";
     LOG_TEE("%s: image token past: %d\n", __func__, n_past);
     eval_string(ctx_llava->ctx_llama, (system_prompt+"<image>").c_str(), params->n_batch, &n_past, false);
     process_eval_image_embed(ctx_llava, embeds, params->n_batch, &n_past, idx++);
@@ -216,24 +227,10 @@ static struct llava_context * minicpmv_init(gpt_params * params, const std::stri
 
 static struct llama_sampling_context * llama_init(struct llava_context * ctx_llava, gpt_params * params, std::string prompt, int &n_past, bool is_first = false){
     std::string user_prompt = prompt;
-    int has_minicpmv_projector = clip_is_minicpmv(ctx_llava->ctx_clip);
-    if (!is_first) {
-        if (has_minicpmv_projector == 2) {
-            user_prompt = "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n" + prompt;
-        }
-        else if (has_minicpmv_projector == 3) {
-            user_prompt = "<|im_start|>user\n" + prompt;
-        }
-    }
+    if (!is_first) user_prompt = "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n" + prompt;
 
     eval_string(ctx_llava->ctx_llama, user_prompt.c_str(), params->n_batch, &n_past, false);
-    if (has_minicpmv_projector == 2) {
-        eval_string(ctx_llava->ctx_llama, "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n", params->n_batch, &n_past, false);
-    }
-    else if (has_minicpmv_projector == 3) {
-        eval_string(ctx_llava->ctx_llama, "<|im_end|><|im_start|>assistant\n", params->n_batch, &n_past, false);
-    }
-
+    eval_string(ctx_llava->ctx_llama, "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n", params->n_batch, &n_past, false);
     // generate the response
 
     LOG_TEE("\n");
@@ -248,11 +245,152 @@ static const char * llama_loop(struct llava_context * ctx_llava,struct llama_sam
     return tmp;
 }
 
+static gpt_params params;
+static std::string CurrentContent = "";
+static int curnum = 0;
+static bool StopFlag = 0;
+static std::queue<std::string>q;
+static int n_past = 0;
+static struct llava_context * ctx_llava; 
+static bool ctx_released = 1 ; //bool值，表示是否已经释放ctx_llava
+
+bool decodeBase64ToFile(const std::string& base64_data, const std::string& output_file) {
+    std::string decoded_data = base64::decode(base64_data);
+
+    std::ofstream ofs(output_file, std::ios::binary);
+    if (!ofs) {
+        std::cerr << "Failed to open output file." << std::endl;
+        return false;
+    }
+    ofs.write(decoded_data.data(), decoded_data.size());
+    ofs.close();
+    return true;
+}
+
+
+void upload_image(const httplib::Request& req, httplib::Response& res){
+    
+    auto data = json::parse(req.body.c_str());
+
+    // std::string image_base64 = data["image"];
+    // std::string image_path = "resized_image.jpg";
+    // decodeBase64ToFile(image_base64,image_path);
+
+    // params.image.resize(1);
+    
+    // int width, height, channels;
+    // unsigned char *image = stbi_load(image_path.c_str(), &width, &height, &channels, 0);
+
+    // float now = width*height;
+
+    // float max_target = 128*128;
+
+    // float k = std::sqrt(max_target/now);
+
+    // int new_width = int(k*width);
+    // int new_height = int(k*height);
+
+    // unsigned char *resized_image = new unsigned char[new_width*new_height*channels];
+
+    // if (stbir_resize_uint8(image, width, height, 0, resized_image, new_width, new_height, 0, channels) == 0) {
+    //     std::cerr << "Failed to resize image." << std::endl;
+    //     stbi_image_free(image);
+    //     delete[] resized_image;
+    //     return ;
+    // }
+
+    // if (stbi_write_jpg("resized_image.jpg", new_width, new_height, channels, resized_image, 100) == 0) {
+    //     std::cerr << "Failed to save resized image." << std::endl;
+    //     stbi_image_free(image);
+    //     delete[] resized_image;
+    //     return ;
+    // }
+
+    // stbi_image_free(image);
+    // delete[] resized_image;
+
+    params.image[0]="resized_image.jpg";
+
+    // image_path = params.image[0];
+    std::string image_path = "C:\\Users\\xinni\\Desktop\\2.PNG";
+    n_past = 0;
+    if(ctx_released == 0){
+        ctx_llava->model = NULL;
+        llava_free(ctx_llava);
+        ctx_released = 1;
+    }
+    ctx_llava = minicpmv_init(&params, image_path, n_past);
+    ctx_released = 0 ;
+    res.set_content("upload successfully","text/plain");
+}
+
+void generate_text(const std::string& prompt){
+        auto ctx_sampling = llama_init(ctx_llava, &params, prompt, n_past, true);
+        const int max_tgt_len = params.n_predict < 0 ? 256 : params.n_predict;
+        for (int i = 0; i < max_tgt_len; i++) {
+            auto tmp = llama_loop(ctx_llava, ctx_sampling, n_past);
+            CurrentContent += tmp;
+            if (strcmp(tmp, "</s>") == 0) break;
+            if (strstr(tmp, "###")) break; // Yi-VL behavior
+            printf("%s", tmp);// mistral llava-1.6
+            if (strstr(CurrentContent.c_str(), "<user>")) break; // minicpm-v
+            fflush(stdout);
+        }
+        llama_sampling_free(ctx_sampling);
+        StopFlag = 1;
+}
+
+void chat_image(const httplib::Request & Req,httplib::Response& res){
+
+    if(ctx_released == 1){
+        return ;
+    }
+
+    auto prompt = json::parse(Req.body.c_str())["prompt"];
+
+    CurrentContent = "";
+    curnum = 0;
+    StopFlag = 0;
+
+    res.set_header("Content-Type", "application/json; charset=utf-8");
+    res.set_header("Cache-Control", "no-cache");
+    res.set_header("Connection", "keep-alive");
+
+    std:: thread chat_thread(generate_text,prompt);
+    chat_thread.detach();
+    res.set_content_provider(
+        "text/plain",
+        [&](size_t offset,httplib::DataSink& sink){
+
+            if(StopFlag){
+                std::vector<char>data(CurrentContent.begin(),CurrentContent.end());
+                curnum = CurrentContent.size();
+                sink.write(data.data(),data.size());
+                sink.done();
+                return false;
+            }
+            if(CurrentContent.size()>curnum){
+                int now = CurrentContent.size();
+                while(now%3!=0)now--;
+                std::vector<char>data(CurrentContent.begin(),CurrentContent.begin()+now);
+                curnum = CurrentContent.size();
+                sink.write(data.data(),data.size());
+            }
+            return true;
+    });
+}
+
+void chat_release(const httplib::Request& req,httplib::Response&res){
+    if(ctx_released == 0){
+        ctx_llava->model = NULL;
+        llava_free(ctx_llava);
+        ctx_released = 1;
+    }
+    return ;
+}
+
 int main(int argc, char ** argv) {
     ggml_time_init();
-
-    gpt_params params;
-
     if (!gpt_params_parse(argc, argv, params)) {
         show_additional_info(argc, argv);
         return 1;
@@ -271,59 +409,14 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    for (auto & image : params.image) {
-        int n_past = 0;
-        auto ctx_llava = minicpmv_init(&params, image, n_past);
+    httplib::Server svr;
 
-        if (!params.prompt.empty()) {
-            LOG_TEE("<user>%s\n", params.prompt.c_str());
-            LOG_TEE("<assistant>");
-            auto ctx_sampling = llama_init(ctx_llava, &params, params.prompt.c_str(), n_past, true);
-            const int max_tgt_len = params.n_predict < 0 ? 256 : params.n_predict;
-            std::string response = "";
-            bool have_tmp = false;
-            for (int i = 0; i < max_tgt_len; i++) {
-                auto tmp = llama_loop(ctx_llava, ctx_sampling, n_past);
-                response += tmp;
-                if (strcmp(tmp, "</s>") == 0){
-                    if(!have_tmp)continue;
-                    else break;
-                }
-                if (strstr(tmp, "###")) break; // Yi-VL behavior
-                have_tmp = true;
-                printf("%s", tmp);
-                if (strstr(response.c_str(), "<user>")) break; // minicpm-v
-
-                fflush(stdout);
-            }
-            llama_sampling_free(ctx_sampling);
-        }else {
-            while (true) {
-                LOG_TEE("<user>");
-                std::string prompt;
-                std::getline(std::cin, prompt);
-                LOG_TEE("<assistant>");
-                auto ctx_sampling = llama_init(ctx_llava, &params, prompt, n_past, true);
-                const int max_tgt_len = params.n_predict < 0 ? 256 : params.n_predict;
-                std::string response = "";
-                for (int i = 0; i < max_tgt_len; i++) {
-                    auto tmp = llama_loop(ctx_llava, ctx_sampling, n_past);
-                    response += tmp;
-                    if (strcmp(tmp, "</s>") == 0) break;
-                    if (strstr(tmp, "###")) break; // Yi-VL behavior
-                    printf("%s", tmp);// mistral llava-1.6
-                    if (strstr(response.c_str(), "<user>")) break; // minicpm-v
-                    fflush(stdout);
-                }
-                llama_sampling_free(ctx_sampling);
-            }
-        }
-        printf("\n");
-        llama_print_timings(ctx_llava->ctx_llama);
-
-        ctx_llava->model = NULL;
-        llava_free(ctx_llava);
-    }
+    //svr.Post("/chat",Chat_handler);
+    svr.Post("/upload_image",upload_image);
+    svr.Post("/chat_image",chat_image);
+    svr.Get("/isready",[](const httplib::Request& req, httplib::Response& res) { res.set_content("ok!", "text/plain"); });
+    svr.Post("/chat_release",chat_release);
+    svr.listen("127.0.0.1",21210);
 
     return 0;
 }
