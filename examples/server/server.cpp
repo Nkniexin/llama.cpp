@@ -13,10 +13,10 @@
 #define CPPHTTPLIB_FORM_URL_ENCODED_PAYLOAD_MAX_LENGTH 1048576
 #include "httplib.h"
 // Change JSON_ASSERT from assert() to GGML_ASSERT:
-#define JSON_ASSERT GGML_ASSERT
+#define JSON_ASSERT GGML_ASSERT //为了保证与其他项目的断言一致
 #include "json.hpp"
 // mime type for sending response
-#define MIMETYPE_JSON "application/json; charset=utf-8"
+#define MIMETYPE_JSON "application/json; charset=utf-8" //定义了一个 MIME 类型，用于指示 HTTP 响应的内容类型为 application/json，并且使用 UTF-8 编码
 
 // auto generated files (update with ./deps.sh)
 #include "colorthemes.css.hpp"
@@ -45,12 +45,12 @@
 #include <signal.h>
 #include <memory>
 
-using json = nlohmann::ordered_json;
+using json = nlohmann::ordered_json; //一种 JSON 类型，它保持 JSON 对象的键值顺序
 
 bool server_verbose = false;
 bool server_log_json = true;
 
-enum stop_type {
+enum stop_type { //使用enum定义两种停止类型
     STOP_TYPE_FULL,
     STOP_TYPE_PARTIAL,
 };
@@ -60,13 +60,13 @@ enum slot_state {
     SLOT_STATE_PROCESSING,
 };
 
-enum slot_command {
+enum slot_command { //列表类型表明声明必须在列表内。
     SLOT_COMMAND_NONE,
     SLOT_COMMAND_LOAD_PROMPT,
     SLOT_COMMAND_RELEASE,
 };
 
-enum server_state {
+enum server_state {  //定义端口服务的状态，两种情况：1.服务正在启动 2.服务已经准备完毕
     SERVER_STATE_LOADING_MODEL,  // Server is starting up, model not fully loaded yet
     SERVER_STATE_READY,          // Server is ready and model is loaded
 };
@@ -111,7 +111,7 @@ struct server_task_multi {
     std::vector<server_task_result> results;
 };
 
-struct slot_params {
+struct slot_params { //定义一些端口服务行为，如是否流式，是否cache_prompt等。
     bool stream       = true;
     bool cache_prompt = false; // remember the prompt to avoid reprocessing all prompt
 
@@ -119,13 +119,13 @@ struct slot_params {
     int32_t  n_discard =  0; // number of tokens after n_keep that may be discarded when shifting context, 0 defaults to half
     int32_t  n_predict = -1; // new tokens to predict
 
-    std::vector<std::string> antiprompt;
+    std::vector<std::string> antiprompt; //一种技巧或策略，目的是引导模型不要生成特定类型的输出，或者避免模型进入某种不希望的状态
 
-    json input_prefix;
-    json input_suffix;
+    json input_prefix;  //输入的前缀，如<|user|>等
+    json input_suffix;  //输入的后缀，如<|asssitant|>等
 };
 
-struct server_slot {
+struct server_slot { //一个slot的配置
     int id;
     int id_task = -1;
     int id_multi = -1;
@@ -147,15 +147,15 @@ struct server_slot {
     int32_t n_predict   = -1; // TODO: disambiguate from params.n_predict
 
     int32_t n_prompt_tokens           = 0;
-    int32_t n_prompt_tokens_processed = 0;
+    int32_t n_prompt_tokens_processed = 0; //处理的prompt的个数
 
     json prompt; // can be either a string, array of strings or array of token ids
 
     // when a task is submitted, we first tokenize the prompt and store it here
-    std::vector<llama_token> prompt_tokens;
+    std::vector<llama_token> prompt_tokens; //llama_token实际就是int32_t
 
-    std::string generated_text;
-    std::vector<llama_token> cache_tokens;
+    std::string generated_text; //生成的文本
+    std::vector<llama_token> cache_tokens; //cache的tonken
     std::vector<completion_token_output> generated_token_probs;
 
     bool infill         = false;
@@ -190,10 +190,10 @@ struct server_slot {
     int64_t t_start_process_prompt;
     int64_t t_start_generation;
 
-    double t_prompt_processing; // ms
+    double t_prompt_processing; // ms，处理prompt所花时间
     double t_token_generation; // ms
 
-    void reset() {
+    void reset() { //重置
         n_prompt_tokens    = 0;
         generated_text     = "";
         truncated          = false;
@@ -211,15 +211,15 @@ struct server_slot {
         generated_token_probs.clear();
     }
 
-    bool has_budget(gpt_params &global_params) {
+    bool has_budget(gpt_params &global_params) { //即是否还需进行推理，总体来看就是查看当前的n_remaining是否>0,大于0意味着还需进行推理，<0则意味着无需再进行推理
         if (params.n_predict == -1 && global_params.n_predict == -1) {
             return true; // limitless
         }
 
-        n_remaining = -1;
+        n_remaining = -1;  
 
         if (params.n_predict != -1) {
-            n_remaining = params.n_predict - n_decoded;
+            n_remaining = params.n_predict - n_decoded;  //n_remaining = params.n_predict - n_decoded.
         } else if (global_params.n_predict != -1) {
             n_remaining = global_params.n_predict - n_decoded;
         }
@@ -227,11 +227,11 @@ struct server_slot {
         return n_remaining > 0; // no budget
     }
 
-    bool available() const {
+    bool available() const { //服务要想启动必须满足该条件
         return state == SLOT_STATE_IDLE && command == SLOT_COMMAND_NONE;
     }
 
-    bool is_processing() const {
+    bool is_processing() const { //判断服务是否再运行
         return (state == SLOT_STATE_IDLE && command == SLOT_COMMAND_LOAD_PROMPT) || state == SLOT_STATE_PROCESSING;
     }
 
@@ -239,10 +239,10 @@ struct server_slot {
         if (command == SLOT_COMMAND_RELEASE) {
             return;
         }
-        generated_token_probs.push_back(token);
+        generated_token_probs.push_back(token); //将新生成的添加到末尾
     }
 
-    void release() {
+    void release() { //释放，即服务停止。
         if (state == SLOT_STATE_PROCESSING) {
             t_token_generation = (ggml_time_us() - t_start_generation) / 1e3;
             command = SLOT_COMMAND_RELEASE;
@@ -273,7 +273,7 @@ struct server_slot {
                 const size_t tmp      = word.size() + last_token_size;
                 const size_t from_pos = text.size() > tmp ? text.size() - tmp : 0;
 
-                pos = text.find(word, from_pos);
+                pos = text.find(word, from_pos); //使用std::string中来查找特定字符串，from_pos表示查找开始的位置，返回的是找到word的索引的起始位置
             } else {
                 pos = find_partial_stop_string(word, text);
             }
@@ -295,7 +295,7 @@ struct server_slot {
         char buffer[512];
 
         double t_token = t_prompt_processing / n_prompt_tokens_processed;
-        double n_tokens_second = 1e3 / t_prompt_processing * n_prompt_tokens_processed;
+        double n_tokens_second = 1e3 / t_prompt_processing * n_prompt_tokens_processed; //每秒处理多少个prompt的tokens
 
         snprintf(buffer, 512, "prompt eval time     = %10.2f ms / %5d tokens (%8.2f ms per token, %8.2f tokens per second)",
                 t_prompt_processing, n_prompt_tokens_processed,
@@ -311,7 +311,7 @@ struct server_slot {
         });
 
         t_token = t_token_generation / n_decoded;
-        n_tokens_second = 1e3 / t_token_generation * n_decoded;
+        n_tokens_second = 1e3 / t_token_generation * n_decoded; //decode阶段每秒生成多少个token
 
         snprintf(buffer, 512, "generation eval time = %10.2f ms / %5d runs   (%8.2f ms per token, %8.2f tokens per second)",
                 t_token_generation, n_decoded,
@@ -338,7 +338,7 @@ struct server_slot {
     }
 };
 
-struct server_metrics {
+struct server_metrics { //server_metrics
     int64_t t_start = 0;
 
     uint64_t n_prompt_tokens_processed_total = 0;
@@ -622,13 +622,13 @@ struct server_response {
 };
 
 struct server_context {
-    llama_model * model = nullptr;
-    llama_context * ctx = nullptr;
+    llama_model * model = nullptr; //模型指针
+    llama_context * ctx = nullptr; //模型上下文，包括kv_cache之类的
     std::vector<llama_lora_adapter_container> lora_adapters;
 
-    gpt_params params;
+    gpt_params params; //  参数配置
 
-    llama_batch batch;
+    llama_batch batch; //batch
 
     bool clean_kv_cache = true;
     bool add_bos_token  = true;
@@ -637,7 +637,7 @@ struct server_context {
     int32_t n_ctx; // total context for all clients / slots
 
     // system prompt
-    bool system_need_update = false;
+    bool system_need_update = false; //默认不更新system_prompt
 
     std::string              system_prompt;
     std::vector<llama_token> system_tokens;
@@ -654,7 +654,7 @@ struct server_context {
     // Necessary similarity of prompt for slot selection
     float slot_prompt_similarity = 0.0f;
 
-    ~server_context() {
+    ~server_context() { //默认构造函数
         if (ctx) {
             llama_free(ctx);
             ctx = nullptr;
@@ -678,10 +678,10 @@ struct server_context {
     bool load_model(const gpt_params & params_) {
         params = params_;
 
-        // dedicate one sequence to the system prompt
+        // dedicate one sequence to the system prompt,将一个序列专用于系统提示符
         params.n_parallel += 1;
 
-        llama_init_result llama_init = llama_init_from_gpt_params(params);
+        llama_init_result llama_init = llama_init_from_gpt_params(params); //下载模型
 
         model = llama_init.model;
         ctx = llama_init.context;
@@ -961,7 +961,7 @@ struct server_context {
             slot.params.n_predict = slot.n_predict;
         }
 
-        // infill
+        // infill,前后缀。
         slot.params.input_prefix = json_value(data, "input_prefix", default_params.input_prefix);
         slot.params.input_suffix = json_value(data, "input_suffix", default_params.input_suffix);
 
@@ -972,7 +972,7 @@ struct server_context {
                 send_error(task, "\"prompt\" must be provided", ERROR_TYPE_INVALID_REQUEST);
                 return false;
             }
-
+            //prompt必须是string或者整数数组
             if ((prompt->is_string()) ||
                 (prompt->is_array() &&  prompt->size() == 1 && prompt->at(0).is_string()) ||
                 (prompt->is_array() && !prompt->empty()     && prompt->at(0).is_number_integer())) {
@@ -1195,7 +1195,7 @@ struct server_context {
             slot.ctx_sampling->params.penalty_prompt_tokens.push_back(result.tok);
         }
 
-        // check if there is incomplete UTF-8 character at the end
+        // check if there is incomplete UTF-8 character at the end，防止出现乱码问题
         bool incomplete = false;
         for (unsigned i = 1; i < 5 && i <= slot.generated_text.size(); ++i) {
             unsigned char c = slot.generated_text[slot.generated_text.size() - i];
@@ -3064,7 +3064,7 @@ int main(int argc, char ** argv) {
         ctx_server.request_completion(id_task, -1, data, false, false);
 
         const auto completion_id = gen_chatcmplid();
-        if (!json_value(data, "stream", false)) {
+        if (!json_value(data, "stream", false)) { 
             server_task_result result = ctx_server.queue_results.recv(id_task);
 
             if (!result.error && result.stop) {
@@ -3075,7 +3075,7 @@ int main(int argc, char ** argv) {
                 res_error(res, result.data);
             }
             ctx_server.queue_results.remove_waiting_task_id(id_task);
-        } else {
+        } else { //实现流式输出
             const auto chunked_content_provider = [id_task, &ctx_server, completion_id](size_t, httplib::DataSink & sink) {
                 while (true) {
                     server_task_result result = ctx_server.queue_results.recv(id_task);
