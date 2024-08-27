@@ -15,6 +15,12 @@ using json = nlohmann::json;
 #define STB_IMAGE_RESIZE_IMPLEMENTATION
 #include "stb_image_resize.h"
 
+extern "C" {
+    #include <libavcodec/avcodec.h>
+    #include <libavformat/avformat.h>
+    #include <libavutil/imgutils.h>
+    #include <libswscale/swscale.h>
+}
 
 
 #include <cstdio>
@@ -32,6 +38,139 @@ struct llava_context {
     struct llama_model * model = NULL;
 };
 
+struct clip_image_u8 {
+    int nx;
+    int ny;
+    std::vector<uint8_t> buf;
+};
+
+static std::vector<clip_image_u8 *> extract_frames(const std::string& video_path) {
+    AVFormatContext* format_ctx = nullptr;
+    if (avformat_open_input(&format_ctx, video_path.c_str(), nullptr, nullptr) < 0) {
+        LOG_TEE("Could not open video file.");
+        return {};
+    }
+
+    if (avformat_find_stream_info(format_ctx, nullptr) < 0) {
+        LOG_TEE("Could not find stream information.");
+        avformat_close_input(&format_ctx);
+        return {};
+    }
+
+    const AVCodec* codec = nullptr;
+    AVCodecContext* codec_ctx = nullptr;
+    int video_stream_index = -1;
+
+    // Find the video stream
+    for (size_t i = 0; i < format_ctx->nb_streams; ++i) {
+        if (format_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            codec = avcodec_find_decoder(format_ctx->streams[i]->codecpar->codec_id);
+            if (codec) {
+                video_stream_index = i;
+                break;
+            }
+        }
+    }
+
+    if (video_stream_index == -1) {
+        LOG_TEE("Could not find video stream.");
+        avformat_close_input(&format_ctx);
+        return {};
+    }
+
+    codec_ctx = avcodec_alloc_context3(codec);
+    if (!codec_ctx) {
+        LOG_TEE("Could not allocate video codec context.");
+        avformat_close_input(&format_ctx);
+        return {};
+    }
+
+    if (avcodec_parameters_to_context(codec_ctx, format_ctx->streams[video_stream_index]->codecpar) < 0) {
+        LOG_TEE("Could not copy codec parameters to codec context.");
+        avcodec_free_context(&codec_ctx);
+        avformat_close_input(&format_ctx);
+        return {};
+    }
+
+    if (avcodec_open2(codec_ctx, codec, nullptr) < 0) {
+        LOG_TEE("Could not open codec.");
+        avcodec_free_context(&codec_ctx);
+        avformat_close_input(&format_ctx);
+        return {};
+    }
+
+    AVFrame* frame = av_frame_alloc();
+    AVFrame* frame_rgb = av_frame_alloc();
+    if (!frame || !frame_rgb) {
+        LOG_TEE("Could not allocate frames.");
+        av_frame_free(&frame);
+        av_frame_free(&frame_rgb);
+        avcodec_free_context(&codec_ctx);
+        avformat_close_input(&format_ctx);
+        return {};
+    }
+
+    int num_bytes = av_image_get_buffer_size(AV_PIX_FMT_RGB24, codec_ctx->width, codec_ctx->height, 1);
+    uint8_t* buffer = (uint8_t*)av_malloc(num_bytes * sizeof(uint8_t));
+    av_image_fill_arrays(frame_rgb->data, frame_rgb->linesize, buffer, AV_PIX_FMT_RGB24, codec_ctx->width, codec_ctx->height, 1);
+
+    struct SwsContext* sws_ctx = sws_getContext(codec_ctx->width, codec_ctx->height, codec_ctx->pix_fmt,
+                                                codec_ctx->width, codec_ctx->height, AV_PIX_FMT_RGB24,
+                                                SWS_BILINEAR, nullptr, nullptr, nullptr);
+
+    std::vector<clip_image_u8 *> frames;
+
+    AVPacket packet;
+    int64_t last_pts = AV_NOPTS_VALUE;
+    int64_t total_frames = format_ctx->streams[video_stream_index]->nb_frames;
+    // LOG_TEE("total_frames: %lld\n", total_frames);
+
+    int64_t frame_interval = (int64_t)codec_ctx->framerate.num / codec_ctx->framerate.den;
+    // LOG_TEE("frame_interval: %lld\n", frame_interval);
+    // LOG_TEE("codec_ctx->framerate.num: %lld\n", codec_ctx->framerate.num);
+    // LOG_TEE("codec_ctx->framerate.den: %lld\n", codec_ctx->framerate.den);
+
+    float frame_len = 1.0 * total_frames / frame_interval;
+    LOG_TEE("frame_len: %f\n", frame_len);
+    if(frame_len > 15){
+        frame_interval = (int64_t)(1.0 * total_frames / 15);
+    }
+    // LOG_TEE("frame_interval: %lld\n", frame_interval);
+    int frame_idx = 0;
+    while (av_read_frame(format_ctx, &packet) >= 0) {
+        if (packet.stream_index == video_stream_index) {
+            if (avcodec_send_packet(codec_ctx, &packet) == 0) {
+                for(;avcodec_receive_frame(codec_ctx, frame) == 0;frame_idx++) {
+                    // int frame_idx = frame->pts/codec_ctx->framerate.den;
+                    // LOG_TEE("frame_idx: %d %d\n", frame_idx, frame_idx % frame_interval);
+                    if (frame->pts != last_pts && (frame_idx) % frame_interval == 0) {
+                        sws_scale(sws_ctx, frame->data, frame->linesize, 0, codec_ctx->height,
+                                  frame_rgb->data, frame_rgb->linesize);
+
+                        clip_image_u8 * img = clip_image_u8_init();
+                        img->nx = codec_ctx->width;
+                        img->ny = codec_ctx->height;
+                        img->buf.resize(num_bytes);
+                        std::copy(buffer, buffer + num_bytes, img->buf.begin());
+
+                        frames.push_back(img);
+                        last_pts = frame->pts;
+                    }
+                }
+            }
+        }
+        av_packet_unref(&packet);
+    }
+
+    av_free(buffer);
+    av_frame_free(&frame_rgb);
+    av_frame_free(&frame);
+    avcodec_free_context(&codec_ctx);
+    avformat_close_input(&format_ctx);
+    sws_freeContext(sws_ctx);
+
+    return frames;
+}
 static void show_additional_info(int /*argc*/, char ** argv) {
     LOG_TEE("\n example usage: %s -m <llava-v1.5-7b/ggml-model-q5_k.gguf> --mmproj <llava-v1.5-7b/mmproj-model-f16.gguf> --image <path/to/an/image.jpg> --image <path/to/another/image.jpg> [--temp 0.1] [-p \"describe the image in detail.\"]\n", argv[0]);
     LOG_TEE("  note: a lower temperature value like 0.1 is recommended for better quality.\n");
@@ -218,6 +357,21 @@ static int process_image(struct llava_context * ctx_llava, struct llava_image_em
     if(!res) return 0;
     return n_past;
 }
+static struct llava_image_embed * video_image_embed(struct clip_ctx * ctx_clip, gpt_params * params, const clip_image_u8 * img){
+    float* image_embed = NULL;
+    int n_image_pos = 0;
+    clip_uhd_max_slice_nums(ctx_clip, 2);
+    bool image_embed_result = llava_image_embed_make_with_clip_img(ctx_clip, params->n_threads, img, &image_embed, &n_image_pos);
+    if (!image_embed_result) {
+        LOG_TEE("%s: coulnd't embed the image\n", __func__);
+        return NULL;
+    }
+
+    auto result = (llava_image_embed*)malloc(sizeof(llava_image_embed));
+    result->embed = image_embed;
+    result->n_image_pos = n_image_pos;
+    return result;
+}
 
 
 static struct llava_image_embed * interleaved_image_embed(struct clip_ctx * ctx_clip, gpt_params * params, const std::string & fname){
@@ -330,10 +484,11 @@ bool decodeBase64ToFile(const std::string& base64_data, const std::string& outpu
 }
 
 
-void upload_image(const httplib::Request& req, httplib::Response& res){
+void upload_image_video(const httplib::Request& req, httplib::Response& res){ //上传图片
     
     auto data = json::parse(req.body.c_str());
     params.image.clear();
+    params.video = "";
 
     if(data.contains("image")&& data["image"].is_array()){ //支持传入多张图片，进行单图或多图联合理解。
         std::vector<std::string>images = data["image"].get<std::vector<std::string>>();
@@ -344,6 +499,9 @@ void upload_image(const httplib::Request& req, httplib::Response& res){
             decodeBase64ToFile(images[i],image_path);
         }
     }
+    else if(data.contains("video")&&data["video"]!=""){
+        params.video = data["video"];
+    }
 
     if(ctx_released == 0){
             ctx_llava->model = NULL;
@@ -351,78 +509,149 @@ void upload_image(const httplib::Request& req, httplib::Response& res){
             ctx_released = 1;
     }
 
-    if(params.image.size() == 0){
-        res.set_content("no images uploaded!","text/plain");
-        return ;
-    }
-
-    else if (params.image.size() == 1){
-        std::string image_path = params.image[0];
-        n_past = 0;
-        ctx_llava = minicpmv_init(&params, image_path, n_past);
-        ctx_released = 0 ;
-    }
-
-    else{
+    if(params.video!=""){
         n_past = 0;
         ctx_llava = llava_init_context(&params);
+        auto video = params.video;        
+        std::vector<clip_image_u8 *> frames = extract_frames(video.c_str());
         process_prompt(0, ctx_llava, &params, n_past);
-        for (auto & image : params.image) {
-            auto embeds = interleaved_image_embed(ctx_llava->ctx_clip, &params, image);
+        LOG_TEE("frames.size: %zu\n", frames.size());
+        for (size_t i = 0; i < frames.size(); ++i) {
+            auto embeds = video_image_embed(ctx_llava->ctx_clip, &params, frames[i]);
             process_input(ctx_llava, &params, 1, "", n_past, embeds);
         }
         ctx_released = 0 ;
     }
+    else{
+        if(params.image.size() == 0){
+            res.set_content("no images uploaded!","text/plain");
+            return ;
+        }
+
+        else if (params.image.size() == 1){
+            std::string image_path = params.image[0];
+            n_past = 0;
+            ctx_llava = minicpmv_init(&params, image_path, n_past);
+            ctx_released = 0 ;
+        }
+
+        else{
+            n_past = 0;
+            ctx_llava = llava_init_context(&params);
+            process_prompt(0, ctx_llava, &params, n_past);
+            for (auto & image : params.image) {
+                auto embeds = interleaved_image_embed(ctx_llava->ctx_clip, &params, image);
+                process_input(ctx_llava, &params, 1, "", n_past, embeds);
+            }
+            ctx_released = 0 ;
+        }
+    }
     res.set_content("upload successfully","text/plain");
 }
 
-void generate_text(const std::string& prompt){
-    if(params.image.size() == 1){
-        //std::cout<<"niexin"<<std::endl;
-        auto ctx_sampling = llama_init(ctx_llava, &params, prompt, n_past, true);
-        const int max_tgt_len = params.n_predict < 0 ? 256 : params.n_predict;
-        for (int i = 0; i < max_tgt_len; i++) {
-            auto tmp = llama_loop(ctx_llava, ctx_sampling, n_past);
-            CurrentContent += tmp;
-            if (strcmp(tmp, "</s>") == 0) break;
-            if (strstr(tmp, "###")) break; // Yi-VL behavior
-            printf("%s", tmp);// mistral llava-1.6
-            if (strstr(CurrentContent.c_str(), "<user>")) break; // minicpm-v
-            fflush(stdout);
-        }
-        llama_sampling_free(ctx_sampling);
+void upload_video(const httplib::Request& req ,httplib::Response& res){ //上传视频
+    ctx_llava = llava_init_context(&params);
+    params.video = "C:\\Users\\xinni\\Desktop\\video.mp4";
+    auto video = params.video;        
+    std::vector<clip_image_u8 *> frames = extract_frames(video.c_str());
+    process_prompt(0, ctx_llava, &params, n_past);
+    LOG_TEE("frames.size: %zu\n", frames.size());
+    for (size_t i = 0; i < frames.size(); ++i) {
+        auto embeds = video_image_embed(ctx_llava->ctx_clip, &params, frames[i]);
+        process_input(ctx_llava, &params, 1, "", n_past, embeds);
     }
-    else{
-        //std::cout<<"niexin"<<std::endl;
+    params.prompt = "视频描述了什么内容\n";
+    process_input(ctx_llava, &params, 0, params.prompt.c_str(), n_past);
+    process_prompt(2, ctx_llava, &params, n_past);
+
+    struct llama_sampling_context * ctx_sampling = llama_sampling_init(params.sparams);
+    const int max_tgt_len = params.n_predict < 0 ? 8192 : params.n_predict;
+    std::string response = "";
+    bool have_tmp = false;
+    for (int i = 0; i < max_tgt_len; i++) {
+        auto tmp = llama_loop(ctx_llava, ctx_sampling, n_past);
+        response += tmp;
+        if (strcmp(tmp, "</s>") == 0){
+            if(!have_tmp)continue;
+            else break;
+        }
+        have_tmp = true;
+        printf("%s", tmp);
+        if (strstr(response.c_str(), "<user>")) break; // minicpm-v 
+
+        fflush(stdout);
+    }
+    llama_sampling_free(ctx_sampling);
+}
+
+void generate_text(const std::string& prompt){
+
+    if(params.video!=""){
         params.prompt = prompt;
         process_input(ctx_llava, &params, 0, params.prompt.c_str(), n_past);
-        //process_prompt(1, ctx_llava, &params, n_past,"这两张图片一样吗\n");
         process_prompt(2, ctx_llava, &params, n_past);
 
         struct llama_sampling_context * ctx_sampling = llama_sampling_init(params.sparams);
         const int max_tgt_len = params.n_predict < 0 ? 8192 : params.n_predict;
-        std::string response = "";
         bool have_tmp = false;
         for (int i = 0; i < max_tgt_len; i++) {
             auto tmp = llama_loop(ctx_llava, ctx_sampling, n_past);
-            response += tmp;
+            CurrentContent += tmp;
             if (strcmp(tmp, "</s>") == 0){
                 if(!have_tmp)continue;
                 else break;
             }
             have_tmp = true;
             printf("%s", tmp);
-            if (strstr(response.c_str(), "<user>")) break; // minicpm-v 
-
+            if (strstr(CurrentContent.c_str(), "<user>")) break; // minicpm-v 
             fflush(stdout);
         }
         llama_sampling_free(ctx_sampling);
 
     }
+    else{
+        if(params.image.size() == 1){
+            auto ctx_sampling = llama_init(ctx_llava, &params, prompt, n_past, true);
+            const int max_tgt_len = params.n_predict < 0 ? 256 : params.n_predict;
+            for (int i = 0; i < max_tgt_len; i++) {
+                auto tmp = llama_loop(ctx_llava, ctx_sampling, n_past);
+                CurrentContent += tmp;
+                if (strcmp(tmp, "</s>") == 0) break;
+                if (strstr(tmp, "###")) break; // Yi-VL behavior
+                printf("%s", tmp);// mistral llava-1.6
+                if (strstr(CurrentContent.c_str(), "<user>")) break; // minicpm-v
+                fflush(stdout);
+            }
+            llama_sampling_free(ctx_sampling);
+        }
+        else{
+            params.prompt = prompt;
+            process_input(ctx_llava, &params, 0, params.prompt.c_str(), n_past);
+            process_prompt(2, ctx_llava, &params, n_past);
+
+            struct llama_sampling_context * ctx_sampling = llama_sampling_init(params.sparams);
+            const int max_tgt_len = params.n_predict < 0 ? 8192 : params.n_predict;
+            bool have_tmp = false;
+            for (int i = 0; i < max_tgt_len; i++) {
+                auto tmp = llama_loop(ctx_llava, ctx_sampling, n_past);
+                CurrentContent += tmp;
+                if (strcmp(tmp, "</s>") == 0){
+                    if(!have_tmp)continue;
+                    else break;
+                }
+                have_tmp = true;
+                printf("%s", tmp);
+                if (strstr(CurrentContent.c_str(), "<user>")) break; // minicpm-v 
+
+                fflush(stdout);
+            }
+            llama_sampling_free(ctx_sampling);
+        }
+    }
         StopFlag = 1;
 }
 
-void chat_image(const httplib::Request & Req,httplib::Response& res){ //跟图片进行对话
+void chat_image_video(const httplib::Request & Req,httplib::Response& res){ //与图片进行对话
 
     if(ctx_released == 1){
         return ;
@@ -494,8 +723,8 @@ int main(int argc, char ** argv) {
     httplib::Server svr;
 
     //svr.Post("/chat",Chat_handler);
-    svr.Post("/upload_image",upload_image);
-    svr.Post("/chat_image",chat_image);
+    svr.Post("/upload_file",upload_image_video);
+    svr.Post("/chat",chat_image_video);
     svr.Get("/isready",[](const httplib::Request& req, httplib::Response& res) { res.set_content("ok!", "text/plain"); });
     svr.Post("/chat_release",chat_release);
     svr.listen("127.0.0.1",21210);

@@ -37,9 +37,26 @@ install(TARGETS ${TARGET} RUNTIME)
 target_link_libraries(${TARGET} PRIVATE common llava ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET} PRIVATE cxx_std_11)
 
+# 设置 FFmpeg路径
+set(FFMPEG_DIR "C:/ffmpeg-master-latest-win64-gpl-shared")
+
+# 指定包含目录
+include_directories("${FFMPEG_DIR}/include")
+
+# 指定链接库路径
+link_directories("${FFMPEG_DIR}/lib")
+
+# 查找 FFmpeg 库
+find_library(AVCODEC_LIBRARY avcodec HINTS "${FFMPEG_DIR}/lib")
+find_library(AVFORMAT_LIBRARY avformat HINTS "${FFMPEG_DIR}/lib")
+find_library(AVUTIL_LIBRARY avutil HINTS "${FFMPEG_DIR}/lib")
+find_library(SWSCALE_LIBRARY swscale HINTS "${FFMPEG_DIR}/lib")
+
 set(TARGET llama-minicpmv-cli)
 add_executable(${TARGET} minicpmv-cli.cpp)
 set_target_properties(${TARGET} PROPERTIES OUTPUT_NAME llama-minicpmv-cli)
 install(TARGETS ${TARGET} RUNTIME)
 target_link_libraries(${TARGET} PRIVATE common llava ${CMAKE_THREAD_LIBS_INIT})
+#链接到 FFmpeg库
+target_link_libraries(${TARGET} PRIVATE ${AVCODEC_LIBRARY} ${AVFORMAT_LIBRARY} ${AVUTIL_LIBRARY} ${SWSCALE_LIBRARY})
 target_compile_features(${TARGET} PRIVATE cxx_std_11)
