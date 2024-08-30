@@ -697,7 +697,7 @@ void chat_release(const httplib::Request& req,httplib::Response&res){ //释放ct
         llava_free(ctx_llava);
         ctx_released = 1;
     }
-    return ;
+    res.set_content("release successfully","text/plain");
 }
 
 int main(int argc, char ** argv) {
